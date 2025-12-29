@@ -262,6 +262,12 @@ def seirhd_step_with_mobility(
         raise ValueError("od_mat 必须是 [N,N] 或 [B,N,N] 形状")
 
     # -------- 2. 结合动作 action 调整 OD（出行干预）--------
+    """
+        关键约定（修复点）：
+        - action 只作用于 OD 的“非对角线”(跨网格出行)；
+        - 被缩减掉的出行概率补回到对角线（留在原地）；
+        - 处理完后每一行仍为概率分布（行和=1），因此不再做会“抵消控制效果”的行归一化。
+    """
     if action is not None:
         act = action.to(device=device, dtype=dtype)
         if act.dim() == 2:
@@ -271,17 +277,35 @@ def seirhd_step_with_mobility(
             assert act.shape == od.shape, "action 为 3D 时，形状须等于 [B,N,N]"
         else:
             raise ValueError("action 必须是 [N,N] 或 [B,N,N]")
+        
+        # mask：对角线=1，非对角线=0（float）
+        eye = torch.eye(N, device=device, dtype=dtype).unsqueeze(0)  # [1,N,N]
+        off = 1.0 - eye                                              # [1,N,N]
 
+        # (1) 取出“出行部分”（非对角线）
+        od_off = od * off  # 对角线变 0，只有跨区出行概率
+
+        # (2) 只对“出行部分”施加控制（缩放）
+        # 即使 act 是全矩阵，对角线也会被 off 抹掉
+        od_off = od_off * act
+
+        # (3) 把缩减掉的概率补回对角线（留在原地）
+        off_sum = od_off.sum(dim=-1, keepdim=True)   # [B,N,1]
+        diag = (1.0 - off_sum).clamp(min=0.0)        # [B,N,1]
+
+        # 得到新 od：非对角=缩放后的出行；对角=补回后的留本地
+        od = od_off + eye * diag
+
+        # 理论上行和应为 1（数值误差很小），这里做一次轻量校正避免漂移
+        row_sum2 = od.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        od = od / row_sum2
+        
         # 逐元素缩放（假设动作值在 [0,1]，代表不同 OD 边的保留比例）
-        od = od * act
+        # od = od * act
         
         # 手动调整对角线元素
-        for i in range(od.shape[0]):
-            od[i, i] = 1 - od[i, :].sum() + od[i, i]
-
-    # 行归一化，确保仍然是概率矩阵
-    row_sum = od.sum(dim=-1, keepdim=True).clamp(min=1e-9)
-    od = od / row_sum
+        # for i in range(od.shape[0]):
+        #     od[i, i] = 1 - od[i, :].sum() + od[i, i]
 
     # -------- 3. 人口流动（OD 搬家）--------
     # 用我们之前写好的流动函数
@@ -300,3 +324,4 @@ def seirhd_step_with_mobility(
     )
 
     return next_state
+
