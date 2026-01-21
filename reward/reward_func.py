@@ -31,16 +31,30 @@ from reward.cost import (
 
 # baseline_new_E.npy 的路径（与你的 baseline 脚本保持一致）
 BASELINE_PATH = "results/baseline_new_E.npy"
+_BASELINE_CACHE = None
 
-if not os.path.exists(BASELINE_PATH):
-    raise FileNotFoundError(
-        f"未找到 baseline_new_E 文件: {BASELINE_PATH}，"
-        f"请先运行 baseline 仿真脚本。"
-    )
+# reward/reward_func.py
 
-# baseline 每个时间步的新增感染数（shape: [T]）
-BASELINE_NEW_E = np.load(BASELINE_PATH)
+import os
+import numpy as np
+import torch
 
+BASELINE_PATH = "results/baseline_new_E.npy"
+_BASELINE_CACHE = None
+
+
+def get_baseline_new_E():
+    global _BASELINE_CACHE
+
+    if _BASELINE_CACHE is None:
+        if not os.path.exists(BASELINE_PATH):
+            raise FileNotFoundError(
+                f"未找到 baseline_new_E 文件: {BASELINE_PATH}，"
+                f"请先运行 baseline 仿真脚本。"
+            )
+        _BASELINE_CACHE = np.load(BASELINE_PATH)
+
+    return _BASELINE_CACHE
 
 # ======================================================
 # 2. 核心 reward 计算函数
@@ -95,12 +109,13 @@ def compute_reward(
     # ==================================================
     # 2. 读取 baseline 的新增感染数
     # ==================================================
-
-    if t >= len(BASELINE_NEW_E):
+    baseline_new_E = get_baseline_new_E()
+    
+    if t >= len(baseline_new_E):
         # 若超过 baseline 长度，默认 baseline 为 0
         baseline_newE = 0.0
     else:
-        baseline_newE = BASELINE_NEW_E[t]
+        baseline_newE = baseline_new_E[t]
 
     baseline_newE = torch.full(
         (batch_size,),

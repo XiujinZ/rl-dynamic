@@ -20,8 +20,7 @@ import random
 from env.env_SEIRHD import SEIRHDEpidemicEnv
 from env.env_func_seirhd import SEIRHDParams
 from utils.utils_data_loader import load_od_matrices, load_residents
-from policy.uniform_policy import UniformControlPolicy  # 假设您已经定义了 UniformControlPolicy
-
+from policy.uniform_policy import UniformControlPolicy  
 
 # ===============================
 # 1. 数据加载
@@ -101,6 +100,7 @@ for t in range(T_sim):
     
     # 环境执行一步，并返回状态、奖励、结束标志等信息
     obs, reward, done, info = env.step(action=action)
+    
     
     # ---- 存量曲线（可视化用）----
     total_I.append(info["total_I"][0])

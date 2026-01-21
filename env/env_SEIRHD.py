@@ -11,6 +11,8 @@ from env.env_func_seirhd import (
     seirhd_step_with_mobility,
 )
 
+from reward.reward_func import compute_reward
+
 class SEIRHDEpidemicEnv:
     """
     类似 Gym 的 SEIRHD + OD 流动 环境。
@@ -28,6 +30,7 @@ class SEIRHDEpidemicEnv:
         device: str = "cpu",
         mobile_compartments=("S", "E", "I", "R"),  # 默认 S,E,I,R 流动；H,D 不流动
         max_steps: Optional[int] = None,           # 最长仿真步数；默认用 T_total
+        wtp: float = 1.0, 
     ):
         """
         od_mats:     np.array [T_total, N, N]，每个时间步的移动概率矩阵
@@ -39,6 +42,8 @@ class SEIRHDEpidemicEnv:
         """
         self.device = torch.device(device)
         self.params = epi_params
+        
+        self.wtp = wtp
 
         # ====== 1. 处理 OD 矩阵 ======
         od_mats_t = torch.as_tensor(od_mats, dtype=torch.float32, device=self.device)
@@ -91,52 +96,6 @@ class SEIRHDEpidemicEnv:
         """
         return self.state
 
-    def _compute_reward_and_done(self) -> Tuple[Tensor, Tensor, Dict]:
-        """
-        根据当前 state 计算 reward 与 done。
-
-        当前是一个占位版本：
-        - reward: 惩罚 I + H（感染者 + 住院者越多越差）
-        - done:
-            * 达到 max_steps
-            * 或 全局 I+H 几乎为 0
-        """
-        assert self.state is not None, "state 为空，请先 reset()。"
-
-        S, E, I, H, R, D = self.state.unbind(dim=-1)  # 每个都是 [B, N]
-
-        total_I = I.sum(dim=1)  # [B]
-        total_H = H.sum(dim=1)  # [B]
-        total_D = D.sum(dim=1)  # [B]
-
-        # 简单 reward：感染+住院越多越差
-        reward = -(total_I + total_H)  # [B]
-
-        # 终止条件 1：时间步到头
-        done_time = torch.full(
-            (self.batch_size,),
-            self.t >= self.max_steps,
-            dtype=torch.bool,
-            device=self.device,
-        )  # [B]
-
-        # 终止条件 2：疫情几乎结束（感染+住院≈0）（已删除）
-        # done_epi = (total_I + total_H < 1.0)  # [B] bool
-
-        done = done_time  # [B] bool
-
-        info = {
-            "total_S": S.sum(dim=1).detach().cpu().numpy(),
-            "total_E": E.sum(dim=1).detach().cpu().numpy(),
-            "total_I": total_I.detach().cpu().numpy(),
-            "total_H": total_H.detach().cpu().numpy(),
-            "total_R": R.sum(dim=1).detach().cpu().numpy(),
-            "total_D": total_D.detach().cpu().numpy(),
-            "t": self.t,
-        }
-
-        return reward, done, info
-
     # ============================
     # Gym 风格接口：reset / step
     # ============================
@@ -178,6 +137,7 @@ class SEIRHDEpidemicEnv:
     def step(
         self,
         action: Optional[Tensor] = None,  # [N,N] 或 [B,N,N]，用于缩放 OD（限流措施）
+        compute_reward: bool = True, 
     ) -> Tuple[Tensor, Tensor, Tensor, Dict]:
         """
         推进一个时间步：
@@ -190,24 +150,201 @@ class SEIRHDEpidemicEnv:
         """
         assert self.state is not None, "请先调用 reset() 再 step()."
 
+        # 0. 保存旧状态
+        prev_state = self.state.clone()
+        
         # 1. 当前时间步的 OD
         od_t = self._get_current_od()  # [N, N]
 
-        # 2. 流动 + 本地传播（合并函数）
+        # 2. 流动 + 本地传播（环境推进）
         next_state = seirhd_step_with_mobility(
             state=self.state,
             od_mat=od_t,
             params=self.params,
             mobile_mask=self.mobile_mask,
             action=action,
-            allow_H_infectious=False,  # 你之后可以改成 True 做实验
+            allow_H_infectious=False,  # 之后可以改成 True 做实验
         )
 
         self.state = next_state
         self.t += 1
 
-        # 3. 观测 & 奖励 & 终止条件
-        obs = self._get_observation()
-        reward, done, info = self._compute_reward_and_done()
+        # 3. 计算reward
+        if compute_reward:
+            reward = compute_reward(
+                prev_state=prev_state,
+                curr_state=self.state,
+                action=action,
+                t=self.t - 1,
+                wtp=self.wtp,
+            )
+        else:
+            reward = torch.zeros((self.batch_size,), device=self.device)
+        
+        # 4. done
+        done = torch.full(
+            (self.batch_size,),
+            self.t >= self.max_steps,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        
+        # 5. info
+        info = {
+            "t": self.t,
+            "reward": reward.detach().cpu().numpy(),
+        }
 
-        return obs, reward, done, info
+        return self.state, reward, done, info
+    
+        # obs = self._get_observation()
+        # reward, done, info = self._compute_reward_and_done()
+        # return obs, reward, done, info
+
+
+    # ============================
+    # （新增）OD -> Flow 相关工具
+    # ============================
+
+    def _normalize_od(self, od: Tensor, eps: float = 1e-9) -> Tensor:
+        """
+        对 OD 做行归一化，保证每行和为 1（数值稳定）。
+        od: [N,N]
+        """
+        row_sum = od.sum(dim=-1, keepdim=True).clamp(min=eps)
+        return od / row_sum
+
+    def _apply_action_to_od(self, od: Tensor, action: Optional[Tensor]) -> Tensor:
+        """
+        把 action 施加到 OD 上，逻辑与 seirhd_step_with_mobility 保持一致：
+        - action 只作用于非对角线（跨区出行）
+        - 缩减掉的概率补回对角线（留在原地）
+        - 最后轻量行归一化
+
+        输入：
+          od:     [N,N]（假设已经行归一化过）
+          action: [N,N] or None（0~1）
+        输出：
+          od_new: [N,N]
+        """
+        if action is None:
+            return od
+
+        N = od.shape[0]
+        act = action.to(device=od.device, dtype=od.dtype)
+
+        if act.dim() != 2 or act.shape != (N, N):
+            raise ValueError(f"action 必须是 [N,N]，当前是 {tuple(act.shape)}")
+
+        act = act.clamp(0.0, 1.0)
+
+        eye = torch.eye(N, device=od.device, dtype=od.dtype)  # [N,N]
+        off = 1.0 - eye
+
+        # 1) 只对非对角线施加控制
+        od_off = od * off
+        od_off = od_off * act  # act 的对角线即使有值也会被 off 抹掉
+
+        # 2) 补回对角线，使每行和为 1
+        off_sum = od_off.sum(dim=-1, keepdim=True)  # [N,1]
+        diag = (1.0 - off_sum).clamp(min=0.0)       # [N,1]
+        od_new = od_off + eye * diag                # [N,N]
+
+        # 3) 轻量归一化，防数值漂移
+        od_new = self._normalize_od(od_new)
+
+        return od_new
+
+    def _compute_outflow(self, state: Tensor) -> Tensor:
+        """
+        计算每个节点本步会流动的人数 outflow_i。
+        state: [B,N,6]
+        return: outflow: [B,N]
+        """
+        # mobile_mask: [6] bool
+        # 把会流动的 comp 加总
+        # state[..., mask] -> [B,N,num_mobile] 然后 sum
+        mobile = state[..., self.mobile_mask]  # [B,N,K]
+        outflow = mobile.sum(dim=-1)           # [B,N]
+        return outflow
+
+    def get_current_flow(
+        self,
+        action: Optional[Tensor] = None,
+        controlled: bool = False,
+    ) -> Tensor:
+        """
+        给 encoder 用的 flow 获取接口。
+
+        - 默认 controlled=False：返回当前时刻的“原始 OD”对应的 flow（选 action 前最常用）
+        - 如果 controlled=True：会把传入的 action 作用到 OD 后，再计算 flow（可选研究设置）
+
+        返回：
+          flow: [B,N,N]  (人数流量矩阵)
+        """
+        assert self.state is not None, "请先 reset() 再调用 get_current_flow()"
+
+        B, N, _ = self.state.shape
+
+        # 1) 当前时刻 OD 概率
+        od = self._get_current_od()          # [N,N]
+        od = self._normalize_od(od)          # 行归一
+
+        # 2) 是否使用控制后的 OD
+        if controlled:
+            od = self._apply_action_to_od(od, action)
+
+        # 3) 计算 outflow（会流动的总人数）
+        outflow = self._compute_outflow(self.state)  # [B,N]
+
+        # 4) flow_ij = outflow_i * od_ij
+        # od: [N,N] -> [1,N,N] -> [B,N,N]
+        flow = outflow.unsqueeze(-1) * od.unsqueeze(0).expand(B, -1, -1)
+
+        return flow
+
+
+    # def _compute_reward_and_done(self) -> Tuple[Tensor, Tensor, Dict]:
+    #     """
+    #     根据当前 state 计算 reward 与 done。
+
+    #     当前是一个占位版本：（已废弃）
+    #     - reward: 惩罚 I + H（感染者 + 住院者越多越差）
+    #     - done:
+    #         * 达到 max_steps
+    #     """
+    #     assert self.state is not None, "state 为空，请先 reset()。"
+
+    #     S, E, I, H, R, D = self.state.unbind(dim=-1)  # 每个都是 [B, N]
+
+    #     total_I = I.sum(dim=1)  # [B]
+    #     total_H = H.sum(dim=1)  # [B]
+    #     total_D = D.sum(dim=1)  # [B]
+
+    #     # 简单 reward：感染+住院越多越差
+    #     reward = -(total_I + total_H)  # [B]
+
+    #     # 终止条件 1：时间步到头
+    #     done_time = torch.full(
+    #         (self.batch_size,),
+    #         self.t >= self.max_steps,
+    #         dtype=torch.bool,
+    #         device=self.device,
+    #     )  # [B]
+
+    #     # 终止条件 2：疫情几乎结束（感染+住院≈0）（已删除）
+    #     # done_epi = (total_I + total_H < 1.0)  # [B] bool
+
+    #     done = done_time  # [B] bool
+
+    #     info = {
+    #         "total_S": S.sum(dim=1).detach().cpu().numpy(),
+    #         "total_E": E.sum(dim=1).detach().cpu().numpy(),
+    #         "total_I": total_I.detach().cpu().numpy(),
+    #         "total_H": total_H.detach().cpu().numpy(),
+    #         "total_R": R.sum(dim=1).detach().cpu().numpy(),
+    #         "total_D": total_D.detach().cpu().numpy(),
+    #         "t": self.t,
+    #     }
+
+    #     return reward, done, info

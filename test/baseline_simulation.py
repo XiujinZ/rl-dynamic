@@ -59,6 +59,7 @@ env = SEIRHDEpidemicEnv(
     epi_params=params,
     device=device,
     max_steps=T_total,  # 31天×24小时
+    wtp=260000.0,
 )
 
 # ===============================
@@ -89,12 +90,14 @@ baseline_new_E = []
 for t in range(T_sim):
     prev_state = env.state
     
-    obs, reward, done, info = env.step(action=None)
+    obs, reward, done, info = env.step(action=None, compute_reward=False)
     
     # ---- 存量曲线（可视化用）----
-    total_I.append(info["total_I"][0])
-    total_H.append(info["total_H"][0])
-    total_D.append(info["total_D"][0])
+    S, E, I, H, R, D = env.state[0].unbind(dim=-1)
+
+    total_I.append(I.sum().item())
+    total_H.append(H.sum().item())
+    total_D.append(D.sum().item())
 
     # ---- baseline 新增感染数（reward 核心）----
     S_prev = prev_state[..., 0].sum().item()
@@ -103,12 +106,14 @@ for t in range(T_sim):
     baseline_new_E.append(newE)
     
     if t % 24 == 0:
+        S, E, I, H, R, D = env.state[0].unbind(dim=-1)
+
         print(
             f"[Day {t//24:02d}] "
             f"newE={newE:.1f}, "
-            f"I={info['total_I'][0]:.0f}, "
-            f"H={info['total_H'][0]:.0f}, "
-            f"D={info['total_D'][0]:.0f}"
+            f"I={I.sum():.0f}, "
+            f"H={H.sum():.0f}, "
+            f"D={D.sum():.0f}"
         )
 
     if done.any():
@@ -160,6 +165,6 @@ print(f"[DONE] 曲线已保存至 {save_path}")
 # 7. 保存计算Reward所需的baseline新增E序列
 # ===============================
 baseline_new_E = np.array(baseline_new_E)
-np.save("data/baseline_new_E.npy", baseline_new_E)
+np.save("results/baseline_new_E.npy", baseline_new_E)
 
 print(f"[DONE] baseline_new_E 已保存，长度 = {len(baseline_new_E)}")
